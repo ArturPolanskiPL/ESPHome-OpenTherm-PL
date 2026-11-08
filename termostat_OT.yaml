@@ -1,0 +1,887 @@
+# Termostat OT — Wemos D1 mini (ESP8266)
+#
+# wersja 1.0 finalna z Watchdog 8/11/2026
+#
+# Własna logika zapotrzebowania na ciepło.
+# Wykorzystanie średniej temperatury pomieszczeń z Home Assistant. 
+# Możliwość użycia dowolnego sensora DS18B20, BLE itd.
+# Regulacja temperatury zasilania na podstawie temperatury zewnętrznej.
+# Własna krzywa grzewcza (zakres konfiguracji 0,1–1,0).
+# Korekta temperatury zasilania na podstawie temperatury wewnętrznej.
+# Regulacja PI uwzględniająca uchyb temperatury i całkę błędu.
+# Ograniczenie maksymalnej i minimalnej temperatury zasilania.
+# Termostat na C.O. i C.W.U.
+# Watchdog:
+#   Kontrola realizacji poleceń wysyłanych do kotła.
+#   Weryfikacja, czy kocioł rzeczywiście zareagował na żądanie grzania.
+#   Ponawianie polecenia w przypadku braku oczekiwanej reakcji.
+#   Cykl kontrolny co 2 minuty.
+#   Ograniczenie liczby ponowień.
+#   Rejestrowanie błędów i nieprawidłowości.
+#   Ochrona przed niekończącymi się próbami wymuszenia pracy kotła.
+#   Diagnostyka stanu regulatora.
+#
+# DIYLESS Master OpenTherm Shield
+
+esphome:
+  name: termostat-ot
+  friendly_name: Termostat OT
+  on_boot:
+    priority: -100
+    then:
+      - switch.turn_on: co_protection
+debug:
+  update_interval: 5min
+  
+esp8266:
+  board: d1_mini
+
+api:
+  encryption:
+    key: Twój tajny kod
+
+wifi:
+  ssid: Nazwa sieci WIFI
+  password: Hasło do sieci WIFI
+  ap:
+    ssid: 
+    password: 
+
+logger:
+  level: INFO
+
+  logs:
+    sensor: WARN
+
+captive_portal:
+
+web_server:
+
+# OpenTherm — Wemos D1 mini
+# D2 = GPIO4 (wejście)
+# D1 = GPIO5 (wyjście)
+
+opentherm:
+  in_pin: GPIO4
+  out_pin: GPIO5
+
+# =========================================================
+# ZMIENNE REGULATORA
+# =========================================================
+
+globals:
+  - id: heating_demand
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: room_integral
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  - id: co_runtime
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: co_pause_remaining
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: dhw_demand
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: watchdog_retries
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: watchdog_fault
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: watchdog_status
+    type: std::string
+    restore_value: no
+    initial_value: '"Oczekuje na kontrolę"'
+
+
+# =========================================================
+# PRZEŁĄCZNIKI KOTŁA
+# =========================================================
+
+switch:
+  - platform: opentherm
+    ch_enable:
+      id: ch_enable
+      name: "Ogrzewanie"
+      restore_mode: RESTORE_DEFAULT_OFF
+
+    dhw_enable:
+      id: dhw_enable
+      name: "Ciepła woda użytkowa"
+      restore_mode: RESTORE_DEFAULT_OFF
+
+  # Ochrona czasowa CO
+  - platform: template
+    id: co_protection
+    name: "Ochrona czasowa CO"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+    on_turn_on:
+      - lambda: |-
+          id(co_runtime) = 0;
+          id(co_pause_remaining) = 0;
+
+    on_turn_off:
+      - lambda: |-
+          id(co_runtime) = 0;
+          id(co_pause_remaining) = 0;
+
+  # Watchdog CO
+  - platform: template
+    id: watchdog_enabled
+    name: "Watchdog CO"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+
+# =========================================================
+# ZADANA TEMPERATURA ZASILANIA CO
+# =========================================================
+
+output:
+  - platform: opentherm
+    t_set:
+      id: ch_setpoint
+      min_value: 25
+      max_value: 40
+      zero_means_zero: true
+
+
+# =========================================================
+# TEMPERATURA ZADANA CWU
+# =========================================================
+
+number:
+  - platform: opentherm
+    t_dhw_set:
+      id: dhw_setpoint
+      name: "Zadana temperatura CWU OT"
+      internal: true
+      step: 1
+      min_value: 38
+      max_value: 65
+      restore_value: true
+      initial_value: 38
+
+  # Nachylenie krzywej pogodowej
+  - platform: template
+    id: heating_curve
+    name: "Nachylenie krzywej grzewczej"
+    min_value: 0.1
+    max_value: 1.0
+    step: 0.1
+    restore_value: true
+    initial_value: 0.8
+    optimistic: true
+
+
+# =========================================================
+# CZUJNIKI BINARNE OPENTHERM
+# =========================================================
+
+binary_sensor:
+  - platform: opentherm
+    ch_active:
+      id: ch_active
+      name: "Ogrzewanie aktywne"
+
+    dhw_active:
+      id: dhw_active
+      name: "Podgrzewanie CWU aktywne"
+
+    flame_on:
+      id: flame_on
+      name: "Płomień kotła"
+
+    fault_indication:
+      id: fault_indication
+      name: "Awaria kotła"
+      entity_category: diagnostic
+
+    diagnostic_indication:
+      id: diagnostic_indication
+      name: "Diagnostyka kotła"
+      entity_category: diagnostic
+
+    service_request:
+      name: "Wymagany serwis"
+      entity_category: diagnostic
+
+    lockout_reset:
+      name: "Reset blokady kotła"
+      entity_category: diagnostic
+
+    low_water_pressure:
+      name: "Niskie ciśnienie wody"
+      entity_category: diagnostic
+
+    flame_fault:
+      name: "Błąd płomienia"
+      entity_category: diagnostic
+
+    air_pressure_fault:
+      name: "Błąd ciśnienia powietrza"
+      entity_category: diagnostic
+
+    water_over_temp:
+      name: "Przegrzanie wody"
+      entity_category: diagnostic
+
+  # -------------------------------------------------------
+  # Sensory diagnostyczne watchdog — zakomentowane
+  # -------------------------------------------------------
+
+  # - platform: template
+  #   name: "Watchdog CO - żądanie"
+  #   id: watchdog_demand_sensor
+  #   lambda: |-
+  #     return id(heating_demand);
+  #   entity_category: diagnostic
+
+  # - platform: template
+  #   name: "Watchdog CO - wykonanie"
+  #   id: watchdog_execution_sensor
+  #   lambda: |-
+  #     return id(room_climate).action == climate::CLIMATE_ACTION_HEATING;
+  #   entity_category: diagnostic
+
+  # - platform: template
+  #   name: "Watchdog CO - potwierdzenie"
+  #   id: watchdog_confirmation_sensor
+  #   lambda: |-
+  #     return id(ch_active).has_state() && id(ch_active).state;
+  #   entity_category: diagnostic
+
+  # - platform: template
+  #   name: "Watchdog CO - błąd"
+  #   id: watchdog_fault_sensor
+  #   lambda: |-
+  #     return id(watchdog_fault);
+  #   entity_category: diagnostic
+
+
+# =========================================================
+# CZUJNIKI
+# =========================================================
+
+sensor:
+# ==== sensor służący do wyliczenia zapotrzebowania na ciepło ====
+  - platform: homeassistant
+    id: ble_sensor
+    entity_id: sensor.sredniatemperaturagora
+    internal: true
+
+  - platform: opentherm
+
+    t_boiler:
+      id: ch_temperature
+      name: "Temperatura kotła"
+      filters:
+        - delta: 0.1
+        - heartbeat: 30s
+
+    t_dhw:
+      id: dhw_temperature
+      name: "Temperatura CWU"
+      filters:
+        - delta: 0.1
+        - heartbeat: 30s
+
+    t_dhw2:
+      name: "Temperatura CWU 2"
+      filters:
+        - delta: 0.1
+        - heartbeat: 30s
+
+    rel_mod_level:
+      id: rel_mod_level
+      name: "Poziom modulacji kotła"
+      filters:
+        - delta: 1.0
+        - heartbeat: 30s
+
+    t_outside:
+      id: outdoor_temp
+      name: "Temperatura zewnętrzna"
+      filters:
+        - delta: 0.1
+        - heartbeat: 30s
+
+    t_ret:
+      id: return_temp
+      name: "Temperatura powrotu"
+      filters:
+        - delta: 0.1
+        - heartbeat: 30s
+
+    max_t_set:
+      name: "Maksymalna zadana temperatura kotła"
+      filters:
+        - heartbeat: 5min
+
+    max_t_set_ub:
+      name: "Górna granica temperatury kotła"
+      filters:
+        - heartbeat: 5min
+
+    max_t_set_lb:
+      name: "Dolna granica temperatury kotła"
+      filters:
+        - heartbeat: 5min
+
+    t_exhaust:
+      name: "Temperatura spalin"
+      entity_category: diagnostic
+      filters:
+        - delta: 1
+        - heartbeat: 30s
+
+    ch_pressure:
+      name: "Ciśnienie wody"
+      entity_category: diagnostic
+      filters:
+        - delta: 0.05
+        - heartbeat: 30s
+
+    oem_fault_code:
+      name: "Kod błędu kotła"
+      entity_category: diagnostic
+      filters:
+        - throttle: 5min
+
+    oem_diagnostic_code:
+      name: "Kod diagnostyczny kotła"
+      entity_category: diagnostic
+      filters:
+        - throttle: 5min
+
+  # -------------------------------------------------------
+  # Licznik ponowień watchdog — zakomentowany
+  # -------------------------------------------------------
+
+  # - platform: template
+  #   name: "Watchdog CO - ponowienia"
+  #   id: watchdog_retries_sensor
+  #   lambda: |-
+  #     return id(watchdog_retries);
+  #   accuracy_decimals: 0
+  #   entity_category: diagnostic
+
+  # -------------------------------------------------------
+  # Diagnostyka ESP — zakomentowana
+  # -------------------------------------------------------
+
+  # - platform: debug
+  #   free:
+  #     name: "ESP Heap Free"
+  #     entity_category: diagnostic
+  #
+  #   block:
+  #     name: "ESP Heap Max Block"
+  #     entity_category: diagnostic
+  #
+  #   fragmentation:
+  #     name: "ESP Heap Fragmentation"
+  #     entity_category: diagnostic
+  #
+  #   loop_time:
+  #     name: "ESP Loop Time"
+  #     entity_category: diagnostic
+
+
+# =========================================================
+# TERMOSTAT CO
+# =========================================================
+
+climate:
+  # ==== termostat template - wymaga wzgłednie nowego wydania esphome ====
+  - platform: template
+    id: room_climate
+    name: "Termostat OT"
+
+    optimistic: true
+    restore_mode: RESTORE
+
+    initial_state:
+      mode: HEAT
+      target_temperature: 20.8
+
+    sensor: ble_sensor
+
+    supports_action: true
+
+    supported_modes:
+      - "OFF"
+      - HEAT
+
+    visual:
+      min_temperature: 18
+      max_temperature: 25
+      temperature_step:
+        target_temperature: 0.1
+        current_temperature: 0.1
+
+    set_target_temperature_action:
+      - logger.log:
+          format: "Temperatura zadana CO: %.1f°C"
+          args:
+            - "x"
+
+    set_mode_action:
+      - logger.log:
+          format: "Tryb termostatu CO: %d"
+          args:
+            - "(int) x"
+
+
+  # =======================================================
+  # TERMOSTAT CWU
+  # Histereza: 1°C
+  # =======================================================
+
+  - platform: template
+    id: dhw_climate
+    name: "Termostat CWU"
+
+    optimistic: true
+    restore_mode: NO_RESTORE
+
+    initial_state:
+      mode: "OFF"
+      target_temperature: 45
+
+    sensor: dhw_temperature
+
+    supports_action: true
+
+    supported_modes:
+      - "OFF"
+      - HEAT
+
+    visual:
+      min_temperature: 30
+      max_temperature: 60
+      temperature_step:
+        target_temperature: 1
+        current_temperature: 0.1
+
+    set_target_temperature_action:
+      - lambda: |-
+          auto call = id(dhw_setpoint).make_call();
+          call.set_value(x);
+          call.perform();
+
+    set_mode_action:
+      - logger.log:
+          format: "Tryb termostatu CWU: %d"
+          args:
+            - "(int) x"
+
+
+# =========================================================
+# STATUS WATCHDOG
+# =========================================================
+
+text_sensor:
+
+  # Diagnostyka resetu ESP — zakomentowana
+  # - platform: debug
+  #   reset_reason:
+  #     name: "ESP Wymaga resetu"
+  #     entity_category: diagnostic
+
+  - platform: template
+    name: "Watchdog CO - status"
+    id: watchdog_status_sensor
+    lambda: |-
+      return id(watchdog_status);
+    entity_category: diagnostic
+
+
+# =========================================================
+# PUBLIKOWANIE STATUSU WATCHDOG
+# Tylko przy zmianie wartości
+# =========================================================
+
+script:
+  - id: publish_watchdog_diagnostics
+    mode: queued
+    then:
+      - lambda: |-
+          if (!id(watchdog_status_sensor).has_state() ||
+              id(watchdog_status_sensor).state != id(watchdog_status))
+            id(watchdog_status_sensor).publish_state(id(watchdog_status));
+
+
+# =========================================================
+# REGULATOR PI + HISTERAZA + OCHRONA CO + CWU
+# Cykl obliczeniowy: 30 sekund
+# =========================================================
+
+interval:
+  - interval: 30s
+    then:
+      - lambda: |-
+          const float room = id(ble_sensor).state;
+          const float outdoor = id(outdoor_temp).state;
+          const float target = id(room_climate).target_temperature;
+
+          // -----------------------------------------------
+          // OCHRONA CO - ODLICZANIE POSTOJU
+          // -----------------------------------------------
+
+          if (id(co_pause_remaining) > 0) {
+            id(co_pause_remaining) -= 30;
+
+            if (id(co_pause_remaining) < 0)
+              id(co_pause_remaining) = 0;
+          }
+
+          // -----------------------------------------------
+          // CWU - TERMOSTAT
+          // -----------------------------------------------
+
+          const float dhw_temp = id(dhw_temperature).state;
+          const float dhw_target = id(dhw_climate).target_temperature;
+
+          if (id(dhw_climate).mode == climate::CLIMATE_MODE_OFF ||
+              isnan(dhw_temp) ||
+              !id(dhw_temperature).has_state()) {
+
+            id(dhw_demand) = false;
+            id(dhw_enable).turn_off();
+
+            id(dhw_climate).action =
+                climate::CLIMATE_ACTION_OFF;
+
+          } else {
+
+            if (dhw_temp <= dhw_target - 1.0f)
+              id(dhw_demand) = true;
+
+            if (dhw_temp >= dhw_target + 1.0f)
+              id(dhw_demand) = false;
+
+            if (id(dhw_demand)) {
+              id(dhw_enable).turn_on();
+              id(dhw_climate).action =
+                  climate::CLIMATE_ACTION_HEATING;
+            } else {
+              id(dhw_enable).turn_off();
+              id(dhw_climate).action =
+                  climate::CLIMATE_ACTION_IDLE;
+            }
+          }
+
+          id(dhw_climate).publish_state();
+
+          // -----------------------------------------------
+          // DANE CO - BEZPIECZNE WYŁĄCZENIE
+          // -----------------------------------------------
+
+          if (isnan(room) || isnan(outdoor) ||
+              !id(ble_sensor).has_state() ||
+              !id(outdoor_temp).has_state()) {
+
+            id(heating_demand) = false;
+            id(room_integral) = 0.0f;
+            id(co_runtime) = 0;
+
+            id(ch_enable).turn_off();
+            id(ch_setpoint).set_level(0.0f);
+
+            id(room_climate).action =
+                climate::CLIMATE_ACTION_IDLE;
+            id(room_climate).publish_state();
+
+            return;
+          }
+
+          // -----------------------------------------------
+          // TERMOSTAT CO - TRYB OFF
+          // -----------------------------------------------
+
+          if (id(room_climate).mode ==
+              climate::CLIMATE_MODE_OFF) {
+
+            id(heating_demand) = false;
+            id(room_integral) = 0.0f;
+            id(co_runtime) = 0;
+
+            id(ch_enable).turn_off();
+            id(ch_setpoint).set_level(0.0f);
+
+            id(room_climate).action =
+                climate::CLIMATE_ACTION_OFF;
+            id(room_climate).publish_state();
+
+            return;
+          }
+
+          // -----------------------------------------------
+          // Histereza pokojowa
+          // -----------------------------------------------
+
+          if (room <= target - 0.1f)
+            id(heating_demand) = true;
+
+          if (room >= target + 0.2f) {
+            id(heating_demand) = false;
+            id(room_integral) = 0.0f;
+            id(co_runtime) = 0;
+          }
+
+          // -----------------------------------------------
+          // BRAK ZAPOTRZEBOWANIA
+          // -----------------------------------------------
+
+          if (!id(heating_demand)) {
+            id(co_runtime) = 0;
+
+            id(ch_enable).turn_off();
+            id(ch_setpoint).set_level(0.0f);
+
+            id(room_climate).action =
+                climate::CLIMATE_ACTION_IDLE;
+            id(room_climate).publish_state();
+
+            return;
+          }
+
+          // -----------------------------------------------
+          // OCHRONA CZASOWA CO
+          // 4 godziny pracy / 30 minut postoju
+          // -----------------------------------------------
+
+          if (id(co_protection).state) {
+
+            if (id(co_pause_remaining) > 0) {
+              id(ch_enable).turn_off();
+              id(ch_setpoint).set_level(0.0f);
+
+              id(room_climate).action =
+                  climate::CLIMATE_ACTION_IDLE;
+              id(room_climate).publish_state();
+
+              ESP_LOGI("ochrona_co",
+                "Postój CO - pozostało %d sekund",
+                id(co_pause_remaining));
+
+              return;
+            }
+
+            id(co_runtime) += 30;
+
+            if (id(co_runtime) >= 14400) {
+              id(co_runtime) = 0;
+              id(co_pause_remaining) = 1800;
+
+              id(ch_enable).turn_off();
+              id(ch_setpoint).set_level(0.0f);
+
+              id(room_climate).action =
+                  climate::CLIMATE_ACTION_IDLE;
+              id(room_climate).publish_state();
+
+              ESP_LOGW("ochrona_co",
+                "Limit 4 godzin osiągnięty. Postój 30 minut.");
+
+              return;
+            }
+
+          } else {
+            id(co_runtime) = 0;
+            id(co_pause_remaining) = 0;
+          }
+
+          // -----------------------------------------------
+          // KRZYWA POGODOWA
+          // Współczynnik regulowany suwakiem HA
+          // -----------------------------------------------
+
+          float weather_setpoint =
+              25.0f + id(heating_curve).state * (20.0f - outdoor);
+
+          // -----------------------------------------------
+          // REGULATOR PI - BEZ ZMIAN
+          // -----------------------------------------------
+
+          const float error = target - room;
+
+          id(room_integral) += error * 30.0f;
+
+          id(room_integral) =
+              clamp(id(room_integral), -10000.0f, 10000.0f);
+
+          const float kp = 0.77f;
+          const float ki = 0.0005f;
+
+          float correction =
+              kp * error + ki * id(room_integral);
+
+          correction = clamp(correction, -5.0f, 5.0f);
+
+          float supply_setpoint =
+              weather_setpoint + correction;
+
+          supply_setpoint =
+              clamp(supply_setpoint, 25.0f, 40.0f);
+
+          float output_level =
+              (supply_setpoint - 25.0f) / 15.0f;
+
+          output_level =
+              clamp(output_level, 0.0f, 1.0f);
+
+          id(ch_setpoint).set_level(output_level);
+          id(ch_enable).turn_on();
+
+          id(room_climate).action =
+              climate::CLIMATE_ACTION_HEATING;
+          id(room_climate).publish_state();
+
+          // Logowanie szczegółowe tylko w poziomie DEBUG
+          ESP_LOGD("regulator",
+            "Pokój: %.2f / zadana: %.2f | Zew: %.1f | Krzywa: %.1f | PI: %.2f | Zasilanie: %.1f",
+            room, target, outdoor, weather_setpoint,
+            correction, supply_setpoint);
+
+      - script.execute: publish_watchdog_diagnostics
+
+
+  # =======================================================
+  # WATCHDOG CO — kontrola co 2 minuty
+  # =======================================================
+
+  - interval: 2min
+    then:
+      - lambda: |-
+          // Watchdog wyłączony z Home Assistant.
+          if (!id(watchdog_enabled).state) {
+            id(watchdog_retries) = 0;
+            id(watchdog_fault) = false;
+            id(watchdog_status) = "Wyłączony";
+            return;
+          }
+
+          const float room = id(ble_sensor).state;
+          const float outdoor = id(outdoor_temp).state;
+          const float target = id(room_climate).target_temperature;
+
+          // Brak wiarygodnych danych.
+          if (!id(ble_sensor).has_state() ||
+              !id(outdoor_temp).has_state() ||
+              isnan(room) || isnan(outdoor)) {
+
+            id(heating_demand) = false;
+            id(watchdog_retries) = 0;
+            id(watchdog_fault) = false;
+            id(ch_enable).turn_off();
+            id(ch_setpoint).set_level(0.0f);
+            id(room_climate).action = climate::CLIMATE_ACTION_IDLE;
+            id(room_climate).publish_state();
+            id(watchdog_status) = "Brak danych temperatury";
+            ESP_LOGW("watchdog_co",
+              "Brak danych temperatury — żądanie CO wyłączone");
+            return;
+          }
+
+          // Tryb OFF ma pierwszeństwo.
+          if (id(room_climate).mode == climate::CLIMATE_MODE_OFF) {
+            id(heating_demand) = false;
+            id(watchdog_retries) = 0;
+            id(watchdog_fault) = false;
+            id(ch_enable).turn_off();
+            id(ch_setpoint).set_level(0.0f);
+            id(room_climate).action = climate::CLIMATE_ACTION_OFF;
+            id(room_climate).publish_state();
+            id(watchdog_status) = "Termostat wyłączony";
+            return;
+          }
+
+          // Histereza pokojowa.
+          if (room <= target - 0.1f)
+            id(heating_demand) = true;
+
+          if (room >= target + 0.2f)
+            id(heating_demand) = false;
+
+          // Ochronny postój CO.
+          if (id(co_protection).state && id(co_pause_remaining) > 0) {
+            id(watchdog_retries) = 0;
+            id(watchdog_fault) = false;
+            id(ch_enable).turn_off();
+            id(ch_setpoint).set_level(0.0f);
+            id(room_climate).action = climate::CLIMATE_ACTION_IDLE;
+            id(room_climate).publish_state();
+            id(watchdog_status) = "Postój ochronny CO";
+            return;
+          }
+
+          // Brak zapotrzebowania.
+          if (!id(heating_demand)) {
+            id(watchdog_retries) = 0;
+            id(watchdog_fault) = false;
+            id(ch_enable).turn_off();
+            id(ch_setpoint).set_level(0.0f);
+            id(room_climate).action = climate::CLIMATE_ACTION_IDLE;
+            id(room_climate).publish_state();
+            id(watchdog_status) = "Brak zapotrzebowania CO";
+            return;
+          }
+
+          // Odświeżenie żądania CO.
+          id(room_climate).action = climate::CLIMATE_ACTION_HEATING;
+          id(room_climate).publish_state();
+          id(ch_enable).turn_on();
+
+          // Potwierdzenie przez kocioł.
+          if (id(ch_active).has_state() && id(ch_active).state) {
+            id(watchdog_retries) = 0;
+            id(watchdog_fault) = false;
+            id(watchdog_status) = "Potwierdzono przez kocioł";
+            ESP_LOGI("watchdog_co",
+              "Kocioł potwierdził żądanie CO");
+            return;
+          }
+
+          // Brak potwierdzenia.
+          id(watchdog_retries) += 1;
+
+          if (id(watchdog_retries) >= 3) {
+            id(watchdog_fault) = true;
+            id(watchdog_status) = "Brak potwierdzenia — ponawiam (" +
+                std::to_string(id(watchdog_retries)) + ")";
+
+            ESP_LOGE("watchdog_co",
+              "Brak potwierdzenia CO. Liczba kontroli bez potwierdzenia: %d",
+              id(watchdog_retries));
+
+          } else {
+            id(watchdog_status) = "Ponawiam żądanie (" +
+                std::to_string(id(watchdog_retries)) + "/3)";
+
+            ESP_LOGW("watchdog_co",
+              "Brak potwierdzenia CO — ponowienie %d/3",
+              id(watchdog_retries));
+          }
+
+      - script.execute: publish_watchdog_diagnostics
