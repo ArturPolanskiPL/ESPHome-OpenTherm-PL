@@ -1,0 +1,67 @@
+# ESPHome OpenTherm PL – Non-Commercial License 1.0
+
+Copyright (c) 2026 ESPHome OpenTherm PL contributors
+
+## 1. Grant of Rights
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Project"), to use, study, modify and develop the Project strictly for personal and non-commercial purposes, subject to the conditions below.
+
+## 2. Permitted Use
+
+The following activities are permitted:
+
+- Personal and private use of the Project.
+- Building hardware based on the Project for personal use.
+- Studying and modifying the source code.
+- Creating derivative works for personal and non-commercial use.
+- Sharing the original or modified source code for non-commercial purposes, provided that copyright notices and this license are retained.
+
+## 3. Restrictions
+
+Without prior written permission from the copyright holder, the following activities are prohibited:
+
+- Selling or commercially distributing the Project or derivative works.
+- Manufacturing or selling hardware products based on the Project for commercial purposes.
+- Using the Project as part of a commercial product or service.
+- Offering paid services, products or subscriptions based on the Project.
+- Removing or modifying copyright notices and license terms.
+
+Commercial use requires a separate written agreement with the copyright holder.
+
+## 4. Redistribution
+
+Any redistribution of the Project or modified versions must:
+
+- Include this license.
+- Preserve all original copyright notices.
+- Clearly identify modifications.
+- Not impose additional restrictions on the rights granted by this license.
+
+Redistribution is permitted only for non-commercial purposes.
+
+## 5. Third-Party Components
+
+This license applies only to materials authored by the Project contributors.
+
+Third-party libraries, frameworks, tools and hardware components remain subject to their respective licenses and terms.
+
+## 6. No Warranty
+
+THE PROJECT IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.
+
+THE AUTHORS ARE NOT LIABLE FOR ANY DAMAGES, EQUIPMENT FAILURE, PROPERTY DAMAGE OR PERSONAL INJURY ARISING FROM THE USE, MODIFICATION OR DISTRIBUTION OF THE PROJECT.
+
+The Project does not replace manufacturer safety systems or certified boiler control equipment.
+
+Users are responsible for ensuring safe installation and operation.
+
+## 7. Commercial Licensing
+
+The copyright holder reserves the right to grant separate commercial licenses under individually agreed terms.
+
+For commercial licensing inquiries, contact the copyright holder through the GitHub repository.
+
+## 8. Governing Law
+
+This license shall be interpreted in accordance with applicable copyright laws and regulations.
+
